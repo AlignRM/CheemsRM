@@ -1,0 +1,12 @@
+accelerate[deepspeed]==1.6.0
+transformers==4.50.3
+colorama
+datasets
+jsonargparse
+jsonlines
+tensorboard
+ray==2.40.0
+wandb
+# vllm==0.7.3
+tqdm
+torch
