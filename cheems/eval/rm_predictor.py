@@ -125,7 +125,7 @@ class GRMPredictor(RMPredictor):
     def reward_fn(self, conv):
         conv_template = self.tokenizer.apply_chat_template(conv, tokenize=False)
         kwargs = {"padding": 'max_length', "truncation": True, "return_tensors": "pt"}
-        tokens = self.tokenizer.encode_plus(conv_template, **kwargs)
+        tokens = self.tokenizer(conv_template, **kwargs)
         with torch.no_grad():
             reward_tensor = self.model(
                 tokens["input_ids"][0].view(1, -1).to(self.model.device),
@@ -153,6 +153,7 @@ class ArmoRMPredictor(RMPredictor):
         input_ids = self.tokenizer.apply_chat_template(
             conv,
             return_tensors="pt",
+            return_dict=False,
             padding=True,
             truncation=self.truncation,
             max_length=self.max_length,
@@ -190,7 +191,7 @@ class Ray2333Predictor(RMPredictor):
     def reward_fn(self, conv):
         conv_template = self.tokenizer.apply_chat_template(conv, tokenize=False)
         kwargs = {"padding": 'max_length', "truncation": True, "return_tensors": "pt"}
-        tokens = self.tokenizer.encode_plus(conv_template, **kwargs)
+        tokens = self.tokenizer(conv_template, **kwargs)
         with torch.no_grad():
             reward_tensor = self.model(
                 tokens["input_ids"][0].to(self.model.device),
@@ -240,12 +241,12 @@ class SentimentPredictor(RMPredictor):
             ).replace(self.tokenizer.bos_token, "")
         ]
         pipe_outputs = self.pipe(test_texts, **{
-            "return_all_scores": True,
+            "top_k": None,
             "function_to_apply": "none",
             "batch_size": 1
         })
-        rewards = [output[0]["score"] for output in pipe_outputs]
-        return rewards[0]
+        reward_label = self.pipe.model.config.id2label[0]
+        return next(output["score"] for output in pipe_outputs[0] if output["label"] == reward_label)
 
 
 class INFORMPredictor(RMPredictor):
@@ -326,7 +327,9 @@ class INFORMPredictor(RMPredictor):
         )
 
     def reward_fn(self, conv):
-        conv_tokenized = self.tokenizer.apply_chat_template(conv, tokenize=True, return_tensors="pt").to("cuda")
+        conv_tokenized = self.tokenizer.apply_chat_template(
+            conv, tokenize=True, return_tensors="pt", return_dict=False
+        ).to("cuda")
         return self.orm(conv_tokenized).logits[0][0].item()
 
 

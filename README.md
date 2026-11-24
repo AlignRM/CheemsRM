@@ -1,7 +1,7 @@
 # Cheems: A Practical Framework for Chinese Reward Models
 
 ![GitHub stars](https://img.shields.io/github/stars/AlignRM/CheemsRM?style=social)
-![Python Version](https://img.shields.io/badge/python-3.8+-blue)
+![Python Version](https://img.shields.io/badge/python-3.11+-blue)
 ![License](https://img.shields.io/github/license/AlignRM/CheemsRM)
 
 This repository contains the official implementation for our paper [Cheems: A Practical Guidance for Building and Evaluating Chinese Reward Models from Scratch](https://arxiv.org/abs/2502.17173).
@@ -21,17 +21,25 @@ Cheems is designed to facilitate the development and evaluation of Chinese rewar
 
 ### Prerequisites
 
-- Python 3.8+
-- PyTorch 2.0+
+- Python 3.11+
+- PyTorch 2.6+
 - CUDA compatible GPU (recommended)
 
 ### Setup
 
 ```bash
 git clone https://github.com/AlignRM/CheemsRM.git
-cd cheems
+cd CheemsRM
 pip install -e .
 ```
+
+For generative evaluation, install CheemsRM and vLLM together in a supported vLLM environment.
+
+```bash
+pip install -e . 'vllm==0.34.0'
+```
+
+Load models and checkpoints only from sources you trust. The checkpoint-loading issue still has no published fix. [Accelerate security advisory](https://github.com/advisories/GHSA-4j2p-28q2-5m79)
 
 ## Data
 

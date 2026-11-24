@@ -1,13 +1,12 @@
 import logging
 import os
-import pathlib
 from datetime import timedelta
 
-import deepspeed as ds
 import torch
 from accelerate import PartialState
 from colorama import Fore, Style
 from transformers import HfArgumentParser
+from transformers.trainer_utils import get_last_checkpoint
 
 from cheems.train.dataset import SampleDataset, collate_fn
 from cheems.train.model import get_reward_model_class
@@ -19,6 +18,9 @@ def main():
     # logging.basicConfig(level=logging.DEBUG)
     parser = HfArgumentParser((TrainingArguments))  # type: ignore
     training_args, = parser.parse_args_into_dataclasses()
+
+    import deepspeed as ds
+
     ds.init_distributed(timeout=timedelta(minutes=int(os.getenv("DEEPSPEED_TIMEOUT", default=training_args.timeout))))
 
     state = PartialState()
@@ -61,8 +63,8 @@ def main():
     RewardModelClass = get_reward_model_class(training_args.model_path)
     model = RewardModelClass.from_pretrained(
         training_args.model_path,
-        use_flash_attention_2="gemma" not in training_args.model_path,
-        torch_dtype=torch.bfloat16,  # 使用flash_attention必须要bf16
+        attn_implementation=None if "gemma" in training_args.model_path else "flash_attention_2",
+        dtype=torch.bfloat16,  # 使用flash_attention必须要bf16
         reg_coef=training_args.reg_coef,
         seed=training_args.seed,
     )
@@ -70,7 +72,7 @@ def main():
 
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         compute_metrics=compute_metrics,
@@ -78,8 +80,9 @@ def main():
         data_collator=collate_fn,
     )
 
-    resume_from_checkpoint = training_args.resume_if_possible and \
-        len(list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))) > 0
+    resume_from_checkpoint = (
+        get_last_checkpoint(checkpoint_path) if training_args.resume_if_possible else None
+    )
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     trainer.save_model(os.path.join(training_args.output_dir, "checkpoint-last"))
 

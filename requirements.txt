@@ -1,12 +1,11 @@
-accelerate[deepspeed]==1.6.0
-transformers==4.50.3
+accelerate[deepspeed]==1.16.0
+transformers[chat-template,sentencepiece]==5.22.2
 colorama
 datasets
 jsonargparse
 jsonlines
 tensorboard
-ray==2.40.0
+ray[data]==2.60.1
 wandb
-# vllm==0.7.3
 tqdm
-torch
+torch>=2.6
