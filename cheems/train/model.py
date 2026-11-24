@@ -1,14 +1,13 @@
 from collections import defaultdict
 from typing import Optional
 
-import deepspeed
 import torch
 from accelerate import PartialState
 from accelerate.utils import TORCH_DISTRIBUTED_OPERATION_TYPES, gather_object, recursively_apply
 from torch import Tensor, nn
 from torch.distributed.nn import functional
 from torch.nn import functional as F
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, initialization
 
 from cheems.train.tokenizer import get_tokenizer
 
@@ -59,16 +58,24 @@ def get_reward_model_class(model_path):
     base_pretrained_class = AutoModelForCausalLM._model_mapping[type(config)]
 
     class RewardModel(base_pretrained_class):  # type: ignore
+        accepts_loss_kwargs = False
+
         def __init__(self, config, seed: int = 0, reg_coef: float = 0.):
             super().__init__(config)
             self.reg_coef = reg_coef
+            self._reward_head_seed = seed
             self.v_head = nn.Linear(self.config.hidden_size, 1, bias=False)
-            with deepspeed.zero.GatheredParameters([self.v_head.weight], modifier_rank=0):
-                tensor = self.v_head.weight.data.clone()
-                torch.manual_seed(seed)
-                tensor = tensor.normal_(mean=0.0, std=1 / (self.config.hidden_size + 1))
-                with torch.no_grad():
-                    self.v_head.weight = nn.Parameter(tensor)
+            # Transformers defers missing-parameter initialization when loading a checkpoint.
+            self.init_weights()
+
+        def _init_weights(self, module):
+            if module is not getattr(self, "v_head", None):
+                return super()._init_weights(module)
+
+            generator = torch.Generator(device=module.weight.device).manual_seed(self._reward_head_seed)
+            initialization.normal_(
+                module.weight, std=1 / (self.config.hidden_size + 1), generator=generator
+            )
 
         @property
         def tokenizer(self):

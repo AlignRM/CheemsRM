@@ -4,7 +4,6 @@ from abc import ABC, abstractmethod
 from typing import List, Union
 
 from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
 
 PROMPT_TEMPLATE = """"Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user question displayed below. You should choose the assistant that follows the user\'s instructions and answers the user\'s question better.
 Your evaluation should consider factors such as the helpfulness, relevance, accuracy, depth, creativity, and level of detail of their responses. Avoid any position biases and ensure that the order in which the responses were presented does not influence your decision. Do not allow the length of the responses to influence your evaluation. Do not favor certain names of the assistants. Be as objective as possible.
@@ -36,7 +35,20 @@ class GenerativePredictor(ABC):
 
 class VllmPredictor(GenerativePredictor):
     def __init__(self, model_name, tensor_parallel_size: int = 1, max_model_len: int = 8192):
-        self.llm = LLM(model=model_name, tensor_parallel_size=tensor_parallel_size, max_model_len=max_model_len)
+        from vllm import LLM, SamplingParams
+
+        backend = None
+        if tensor_parallel_size > 1:
+            import ray
+
+            if ray.is_initialized() and ray.util.get_current_placement_group() is not None:
+                backend = "ray"
+        self.llm = LLM(
+            model=model_name,
+            tensor_parallel_size=tensor_parallel_size,
+            max_model_len=max_model_len,
+            distributed_executor_backend=backend,
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.sampling_params = SamplingParams(temperature=0.)
 

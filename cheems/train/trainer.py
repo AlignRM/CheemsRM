@@ -1,18 +1,18 @@
 import ast
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from json import JSONDecodeError
 from typing import List, Optional, Union
 
-import numpy as np
 import torch
 import transformers
-from accelerate import PartialState
 from torch.utils.data import Dataset, SequentialSampler
 from transformers import IntervalStrategy, SchedulerType, TrainerCallback
 from transformers.trainer import TRAINER_STATE_NAME, logger
-from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, has_length
+from transformers.trainer_callback import ExportableState
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, SaveStrategy, has_length, rotate_checkpoints
 
 from cheems.eval.metrics import metric_fn
 from cheems.train.dataset import BatchSampler
@@ -66,11 +66,7 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     do_strip: bool = field(
         default=True,
-        metadata={
-            "help": (
-                "build_sample的时候是否要do_strip",
-            )
-        },
+        metadata={"help": "build_sample的时候是否要do_strip"},
     )
     do_shuffle: bool = field(default=True)
     timeout: int = field(default=60)
@@ -112,13 +108,20 @@ class TrainingArguments(transformers.TrainingArguments):
             )
         },
     )
-    save_strategy: Union[IntervalStrategy, str] = field(
+    save_strategy: Union[SaveStrategy, str] = field(
         default="epoch",
         metadata={"help": "The checkpoint save strategy to use."},
     )
-    evaluation_strategy: Union[IntervalStrategy, str] = field(
+    eval_strategy: Union[IntervalStrategy, str] = field(
         default="steps",
-        metadata={"help": "The evaluation strategy to use."},
+        metadata={
+            "aliases": ["--evaluation_strategy", "--evaluation-strategy"],
+            "help": "The evaluation strategy to use.",
+        },
+    )
+    warmup_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "Fraction of training steps used for warmup when warmup_steps is zero."},
     )
     per_device_train_batch_size: int = field(
         default=1, metadata={"help": "Batch size per GPU/TPU/MPS/NPU core/CPU for training."}
@@ -138,12 +141,6 @@ class TrainingArguments(transformers.TrainingArguments):
     report_to: Optional[List[str]] = field(
         default_factory=lambda: ["tensorboard"],
         metadata={"help": "The list of integrations to report the results and logs to."}
-    )
-    save_safetensors: Optional[bool] = field(
-        default=True,
-        metadata={
-            "help": "Use safetensors saving and loading for state dicts instead of default torch.load and torch.save."
-        },
     )
     resume_if_possible: bool = field(
         default=True,
@@ -168,6 +165,8 @@ class TrainingArguments(transformers.TrainingArguments):
 
     def __post_init__(self):
         super(TrainingArguments, self).__post_init__()
+        if self.warmup_ratio is not None and not 0 <= self.warmup_ratio <= 1:
+            raise ValueError("warmup_ratio must be between 0 and 1")
         self.train_data_path = self.parse(self.train_data_path)
         assert type(self.train_data_path) in [list, str], "train_data_path should be list or str"
 
@@ -178,6 +177,11 @@ class TrainingArguments(transformers.TrainingArguments):
             assert all(isinstance(path, str) for path in self.test_data_path)
         else:
             assert isinstance(self.test_data_path, str)
+
+    def get_warmup_steps(self, num_training_steps: int):
+        if self.warmup_ratio is not None and self.warmup_steps == 0:
+            return math.ceil(num_training_steps * self.warmup_ratio)
+        return super().get_warmup_steps(num_training_steps)
 
 
 class EvaluateAtEpochCallback(TrainerCallback):
@@ -190,28 +194,37 @@ class Trainer(transformers.Trainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_callback(EvaluateAtEpochCallback())
+        self._checkpoint_metrics = None
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        self._train_sampler = None
-        if not (self.train_dataset is None or not has_length(self.train_dataset)):
-            self._train_sampler = BatchSampler(
-                data_source=self.train_dataset,
-                batch_size=self.args.world_size * self.args.per_device_train_batch_size,
-                do_shuffle=self.args.do_shuffle,
-                seed=self.args.seed,
-            )
-        return self._train_sampler
-
-    def get_train_dataloader(self) -> Optional[torch.utils.data.Sampler]:
-        dataloader = super(Trainer, self).get_train_dataloader()
-        if self._train_sampler is not None:
-            dataloader.set_sampler(self._train_sampler)
-        return dataloader
+    def _get_train_sampler(self, train_dataset=None) -> Optional[BatchSampler]:
+        if train_dataset is None:
+            train_dataset = self.train_dataset
+        if train_dataset is None or not has_length(train_dataset):
+            return None
+        return BatchSampler(
+            data_source=train_dataset,
+            batch_size=self.args.world_size * self.args.per_device_train_batch_size,
+            do_shuffle=self.args.do_shuffle,
+            seed=self.args.seed,
+        )
 
     def _get_eval_sampler(self, eval_dataset: Dataset) -> Optional[torch.utils.data.Sampler]:
         return SequentialSampler(eval_dataset)
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _maybe_log_save_evaluate(self, *args, **kwargs):
+        self._checkpoint_metrics = None
+        super()._maybe_log_save_evaluate(*args, **kwargs)
+
+    def _determine_best_metric(self, metrics, trial):
+        self._checkpoint_metrics = metrics
+        if not self.control.should_save and self.args.save_strategy != SaveStrategy.BEST:
+            return False
+        is_best = super()._determine_best_metric(metrics, trial)
+        if is_best:
+            self.state.best_global_step = self.state.global_step
+        return is_best
+
+    def _save_checkpoint(self, model, trial):
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save except FullyShardedDDP.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
@@ -234,36 +247,31 @@ class Trainer(transformers.Trainer):
             staging_output_dir = os.path.join(run_dir, f"tmp-{checkpoint_folder}")
         self.save_model(staging_output_dir, _internal_call=True)
 
+        if self.state.best_global_step:
+            best_dir = os.path.join(run_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.best_global_step}")
+            if best_dir == output_dir or os.path.isdir(best_dir):
+                self.state.best_model_checkpoint = best_dir
+
         if not self.args.save_only_model:
-            # Save optimizer and scheduler
             self._save_optimizer_and_scheduler(staging_output_dir)
-            # Save RNG state
+            self._save_scaler(staging_output_dir)
             self._save_rng_state(staging_output_dir)
-
-        # Determine the new best metric / best model checkpoint
-        if metrics is not None and self.args.metric_for_best_model is not None:
-            metric_to_check = self.args.metric_for_best_model
-            if not metric_to_check.startswith("eval_"):
-                metric_to_check = f"eval_{metric_to_check}"
-            metric_value = metrics[metric_to_check]
-
-            operator = np.greater if self.args.greater_is_better else np.less
-            if (
-                    self.state.best_metric is None
-                    or self.state.best_model_checkpoint is None
-                    or operator(metric_value, self.state.best_metric)
-            ):
-                self.state.best_metric = metric_value
-                self.state.best_model_checkpoint = output_dir
 
         # Save the Trainer state
         if self.args.should_save:
+            for callback in self.callback_handler.callbacks + [self.control]:
+                if isinstance(callback, ExportableState):
+                    name = type(callback).__name__
+                    state = self.state.stateful_callbacks.get(name)
+                    if isinstance(state, list):
+                        state.append(callback.state())
+                    else:
+                        self.state.stateful_callbacks[name] = callback.state()
             self.state.save_to_json(os.path.join(staging_output_dir, TRAINER_STATE_NAME))
-            state = PartialState()  # noqa: F821
-            if state.is_main_process:
+            if self.is_world_process_zero():
                 output_file_path = os.path.join(staging_output_dir, STORE_ACC_NAME)
                 with open(output_file_path, 'w') as f:
-                    json.dump(metrics, f, indent=4, ensure_ascii=False)
+                    json.dump(self._checkpoint_metrics, f, indent=4, ensure_ascii=False)
 
         if self.args.push_to_hub:
             self._push_from_checkpoint(staging_output_dir)
@@ -289,7 +297,11 @@ class Trainer(transformers.Trainer):
             if self.args.should_save:
                 # Solely rely on numerical checkpoint id for rotation.
                 # mtime is not reliable especially on some fuse fs in cloud environments.
-                self._rotate_checkpoints(use_mtime=False, output_dir=run_dir)
+                rotate_checkpoints(
+                    output_dir=run_dir,
+                    save_total_limit=self.args.save_total_limit,
+                    best_model_checkpoint=self.state.best_model_checkpoint,
+                )
 
         self.args.distributed_state.wait_for_everyone()
 

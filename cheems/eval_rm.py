@@ -2,16 +2,13 @@ import itertools
 import json
 import random
 from collections import defaultdict
-from functools import partial
 from typing import Any, Dict, List, Union
 
 import ray
 import torch
 from jsonargparse import CLI
-from ray._private.utils import hex_to_binary
-from ray._raylet import PlacementGroupID
-from ray.data import DataContext
-from ray.util.placement_group import PlacementGroup, placement_group_table, remove_placement_group
+from ray.data import ActorPoolStrategy, DataContext
+from ray.util.placement_group import placement_group, remove_placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from cheems.eval.gen_predictor import PREDICTOR_MAP as GENERATIVE_PREDICTOR_MAP
@@ -57,11 +54,11 @@ def rm_evaluate(
         all_dataset.extend(dataset)
 
     predictor_class = create_rm_predictor(predictor_class, model_name)
-    num_instances = (num_gpus // num_gpus_per_predictor, 512)
+    actor_pool = ActorPoolStrategy(min_size=num_gpus // num_gpus_per_predictor, max_size=512)
     ds = ray.data.from_items(all_dataset)
     ds = ds.map(
         predictor_class,
-        concurrency=num_instances,
+        compute=actor_pool,
         num_gpus=num_gpus_per_predictor
     )
     scored_dataset = list(ds.iter_rows())
@@ -91,11 +88,12 @@ def create_generative_predictor(predictor_class, model_name, tensor_parallel_siz
             super().__init__(model_name, tensor_parallel_size)
 
         def __call__(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-            batch['judgment'] = self.compare_fn(
+            judgments = self.compare_fn(
                 question=batch['question'],
                 answer_a=batch['answer_a'],
                 answer_b=batch['answer_b'],
             )
+            batch['judgment'] = [judgments] if isinstance(judgments, str) else judgments
             return batch
     return Predictor
 
@@ -134,61 +132,57 @@ def generative_evaluate(
                         'origin_path': path,
                     })
 
+    placement_groups = []
     if tensor_parallel_size == 0:
         # Do not use GPT, and use APIPredictor
         ray_map_kwarg = {
             "num_gpus": 0,
             "num_cpus": min(int(ray.cluster_resources()['CPU']) / batch_size, 1),
-            "concurrency": batch_size,
+            "compute": ActorPoolStrategy(size=batch_size),
         }
         override_num_blocks = len(all_dataset) // 2
     else:
         override_num_blocks = None
-        num_instances = (num_gpus // tensor_parallel_size, 512)
+        actor_pool = ActorPoolStrategy(min_size=num_gpus // tensor_parallel_size, max_size=512)
         ctx = DataContext.get_current()
         ctx.wait_for_min_actors_s = 60 * 15 * tensor_parallel_size
         if tensor_parallel_size == 1:
             # For tensor_parallel_size == 1, we simply set num_gpus=1.
             ray_map_kwarg = {
                 "num_gpus": 1,
-                "concurrency": num_instances,
+                "compute": actor_pool,
                 "batch_size": batch_size,
             }
         elif tensor_parallel_size > 1:
             # Otherwise, we have to set num_gpus=0 and provide
             # a function that will create a placement group for
             # each instance.
-            def scheduling_strategy_fn(tensor_parallel_size):
+            def scheduling_strategy_fn():
                 # One bundle per tensor parallel worker
-                pg = ray.util.placement_group(
+                pg = placement_group(
                     [{"GPU": 1, "CPU": 1}] * tensor_parallel_size,
                     strategy="STRICT_PACK",
                 )
+                placement_groups.append(pg)
                 return dict(scheduling_strategy=PlacementGroupSchedulingStrategy(
                     pg, placement_group_capture_child_tasks=True
                 ))
 
             ray_map_kwarg = {
                 "num_gpus": 0,
-                "concurrency": num_instances,
-                "ray_remote_args_fn": partial(
-                    scheduling_strategy_fn,
-                    tensor_parallel_size=tensor_parallel_size
-                ),
+                "compute": actor_pool,
+                "ray_remote_args_fn": scheduling_strategy_fn,
                 "batch_size": batch_size,
             }
 
     predictor_class = create_generative_predictor(predictor_class, model_name, tensor_parallel_size)
     ds = ray.data.from_items(all_dataset, override_num_blocks=override_num_blocks)
     ds = ds.map_batches(predictor_class, **ray_map_kwarg)
-    judged_dataset = list(ds.iter_rows())
-
-    for placement_group_info in placement_group_table().values():
-        # https://github.com/ray-project/ray/blob/ray-2.7.0/python/ray/util/placement_group.py#L291
-        pg = PlacementGroup(
-            PlacementGroupID(hex_to_binary(placement_group_info["placement_group_id"]))
-        )
-        remove_placement_group(pg)
+    try:
+        judged_dataset = list(ds.iter_rows())
+    finally:
+        for pg in placement_groups:
+            remove_placement_group(pg)
 
     all_metrics = dict()
     for path in data_path:
